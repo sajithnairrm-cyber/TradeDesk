@@ -25,17 +25,17 @@ const SHELL_FILES = [
   './index.html',
   './manifest.json',
   './favicon.ico',
-  './icons/icon-72.png',
-  './icons/icon-96.png',
-  './icons/icon-128.png',
-  './icons/icon-144.png',
-  './icons/icon-152.png',
-  './icons/icon-192.png',
-  './icons/icon-384.png',
-  './icons/icon-512.png',
-  './icons/apple-touch-icon.png',
-  './icons/maskable-icon.png',
-  './icons/monochrome-icon.png'
+  './icon-72.png',
+  './icon-96.png',
+  './icon-128.png',
+  './icon-144.png',
+  './icon-152.png',
+  './icon-192.png',
+  './icon-384.png',
+  './icon-512.png',
+  './apple-touch-icon.png',
+  './maskable-icon.png',
+  './monochrome-icon.png'
 ];
 
 /* Hosts whose responses must always be live. Anything matching these is
