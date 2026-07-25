@@ -644,6 +644,17 @@ body { margin: 0; }
   .pl-tbox .v { font-size: 14px; font-weight: 640; margin-top: 2px; font-variant-numeric: tabular-nums; }
   .pl-tbox .v.up { color: var(--green); } .pl-tbox .v.down { color: var(--red); }
 
+  /* --- Delta sync --- */
+  .pl-sync-note {
+    font-size: 12px; line-height: 1.55; color: var(--text-secondary);
+    background: var(--surface-1); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px;
+  }
+  .pl-sync-note b { color: var(--ink); font-weight: 620; }
+  .pl-sync-remember { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-secondary); margin-left: auto; }
+  .pl-sync-remember input { width: 15px; height: 15px; }
+  .pl-sync-status.ok { color: var(--green); }
+  .pl-sync-status.err { color: var(--red); }
+
   /* --- edit modal --- */
   .pl-modal {
     position: fixed; inset: 0; z-index: 90; background: rgba(0,0,0,0.42);
@@ -1548,6 +1559,8 @@ body { margin: 0; }
           <button id="pl-backup" type="button">⬇ Backup everything</button>
           <div class="pl-menu-sep"></div>
           <button id="pl-import" type="button">⬆ Import backup</button>
+          <div class="pl-menu-sep"></div>
+          <button id="pl-sync" type="button">🔗 Sync from Delta</button>
           <button id="pl-print" type="button">🖨 Print report</button>
           <button id="pl-privacy" type="button"><span id="pl-privacy-label">🙈 Hide numbers</span></button>
           <div class="pl-menu-sep"></div>
@@ -1645,6 +1658,43 @@ body { margin: 0; }
       <div class="pc-note" id="pc-note"></div>
     </div>
   </details>
+
+  <!-- ---------- Delta sync modal ---------- -->
+  <div class="pl-modal" id="pl-sync-modal" style="display:none">
+    <div class="pl-modal-card">
+      <div class="pl-modal-head">
+        <div><div class="pl-modal-t">Sync from Delta</div>
+        <div class="pl-modal-s">Pulls your fills through your own read-only proxy.</div></div>
+        <button class="pl-x" id="pl-sync-close" type="button" aria-label="Close">&#10005;</button>
+      </div>
+
+      <div class="pl-sync-note" id="pl-sync-firstrun">
+        This reads closed fills from Delta and turns them into completed trades.
+        It never places orders and never sees your API secret &mdash; that stays inside
+        your Cloudflare Worker. Set the Worker up once (see <b>delta-proxy-worker.js</b>),
+        then paste its URL below.
+      </div>
+
+      <div class="field"><label for="pl-sync-url">Worker URL</label>
+        <input id="pl-sync-url" class="pl-input" type="url" style="width:100%" placeholder="https://trade-desk-delta.yourname.workers.dev" autocomplete="off"></div>
+      <div class="field"><label for="pl-sync-token">Client token <span style="color:var(--text-muted)">(optional)</span></label>
+        <input id="pl-sync-token" class="pl-input" type="password" style="width:100%" placeholder="only if you set CLIENT_TOKEN in the Worker" autocomplete="off"></div>
+
+      <div class="pl-form-grid">
+        <div class="field"><label for="pl-sync-from">Fills from</label><input id="pl-sync-from" class="pl-input" type="date"></div>
+        <div class="field"><label for="pl-sync-to">Fills to</label><input id="pl-sync-to" class="pl-input" type="date"></div>
+      </div>
+
+      <div class="pl-calc" id="pl-sync-status">Enter your Worker URL, choose a date range, then sync.</div>
+
+      <div class="pl-foot" style="position:static;background:none;border:none;margin:0;padding:0">
+        <button class="btn" id="pl-sync-go" type="button">Sync now</button>
+        <button class="btn ghost" id="pl-sync-test" type="button">Test connection</button>
+        <label class="pl-sync-remember"><input type="checkbox" id="pl-sync-save"> Remember URL on this device</label>
+      </div>
+      <p class="footnote" style="margin-top:10px">Imported fills are matched by Delta&rsquo;s own fill ID, so re-syncing the same range never creates duplicates. Existing manual trades are left untouched.</p>
+    </div>
+  </div>
 
   <!-- ---------- Edit modal ---------- -->
   <div class="pl-modal" id="pl-modal" style="display:none">
@@ -4510,6 +4560,161 @@ function plHandleFile(f){
   };
   rd.readAsText(f);
 }
+/* ============================================================================
+   DELTA SYNC
+   Reads your fills through the read-only Worker proxy and folds them into the
+   trade store as completed trades. Delta returns one row PER FILL, so several
+   fills that make up one position are grouped by order into a single trade.
+   Everything is keyed on Delta's IDs, so re-syncing is idempotent.
+   ========================================================================= */
+const PL_SYNC_KEY = 'trade_desk_delta_cfg_v1';
+
+function plSyncCfg(){
+  try { return JSON.parse(localStorage.getItem(PL_SYNC_KEY)) || {}; } catch(e){ return {}; }
+}
+function plSyncCfgSave(o){
+  try { localStorage.setItem(PL_SYNC_KEY, JSON.stringify(o)); } catch(e){}
+}
+
+/* Map a Delta product symbol to the asset buckets the desk understands. */
+function plDeltaAsset(sym){
+  const u = (sym || '').toUpperCase();
+  if(u.includes('BTC')) return 'BTC';
+  if(u.includes('ETH')) return 'ETH';
+  if(u.includes('XAU') || u.includes('GOLD') || u.includes('PAXG')) return 'GOLD';
+  return null;
+}
+
+function plSyncStatus(msg, kind){
+  const el = $('pl-sync-status');
+  if(!el) return;
+  el.innerHTML = msg;
+  el.className = 'pl-calc pl-sync-status' + (kind ? ' ' + kind : '');
+}
+
+async function plSyncFetch(test){
+  const cfg = {
+    url: ($('pl-sync-url') || {}).value.trim(),
+    token: ($('pl-sync-token') || {}).value.trim(),
+    from: ($('pl-sync-from') || {}).value,
+    to: ($('pl-sync-to') || {}).value
+  };
+  if(!cfg.url){ plSyncStatus('Enter your Worker URL first.', 'err'); return; }
+
+  // Persist (URL + token) only if the box is ticked — never silently.
+  if(($('pl-sync-save') || {}).checked) plSyncCfgSave({ url: cfg.url, token: cfg.token });
+
+  const base = cfg.url.replace(/\/+$/, '');
+  const qs = new URLSearchParams();
+  qs.set('page_size', '100');
+  // Delta wants microsecond epoch for start_time/end_time.
+  if(cfg.from) qs.set('start_time', String(Date.parse(cfg.from + 'T00:00:00Z') * 1000));
+  if(cfg.to)   qs.set('end_time',   String((Date.parse(cfg.to + 'T23:59:59Z')) * 1000));
+  const endpoint = base + '/v2/fills?' + qs.toString();
+
+  plSyncStatus(test ? 'Testing connection…' : 'Fetching fills from Delta…');
+  let res, data;
+  try {
+    res = await fetch(endpoint, {
+      headers: cfg.token ? { 'x-client-token': cfg.token } : {}
+    });
+  } catch(err){
+    plSyncStatus('Could not reach the Worker. Check the URL, and that the Worker is deployed.', 'err');
+    return;
+  }
+  try { data = await res.json(); } catch(e){ data = null; }
+
+  if(!res.ok){
+    const reason = data && (data.error || (data.message)) || ('HTTP ' + res.status);
+    const hint = res.status === 401 ? ' — client token mismatch.'
+              : res.status === 403 ? ' — the Worker refused this path.'
+              : (data && /signature|Unauthorized|invalid_api_key/i.test(JSON.stringify(data))) ? ' — Delta rejected the key. Is it read-only and active?'
+              : '';
+    plSyncStatus('Sync failed: ' + reason + hint, 'err');
+    return;
+  }
+
+  const fills = (data && (data.result || data.fills)) || [];
+  if(!Array.isArray(fills)){ plSyncStatus('Unexpected response shape from the Worker.', 'err'); return; }
+
+  if(test){
+    plSyncStatus(`✓ Connected. Delta returned ${fills.length} fill${fills.length === 1 ? '' : 's'} for this range.`, 'ok');
+    return;
+  }
+  plSyncImport(fills);
+}
+
+/* Fold raw fills into trades and merge into the store without duplicates. */
+function plSyncImport(fills){
+  // group by order id (fallback: fill id) so partial fills collapse into one trade
+  const groups = {};
+  for(const f of fills){
+    const asset = plDeltaAsset(f.product_symbol || (f.product && f.product.symbol));
+    if(!asset) continue;                          // skip instruments the desk doesn't track
+    const key = 'delta:' + (f.order_id || f.id);
+    (groups[key] = groups[key] || []).push({ f, asset });
+  }
+
+  const existing = new Set(journal.map(t => t.deltaKey).filter(Boolean));
+  let added = 0, skipped = 0;
+
+  for(const key in groups){
+    if(existing.has(key)){ skipped++; continue; }
+    const rows = groups[key];
+    const asset = rows[0].asset;
+    // size-weighted average price across the fills in this order
+    let qty = 0, notional = 0, fee = 0, side = null, ts = 0;
+    for(const { f } of rows){
+      const q = Math.abs(Number(f.size) || 0);
+      const px = Number(f.price) || 0;
+      qty += q; notional += q * px; fee += Number(f.commission || f.fee || 0);
+      side = (f.side || side);
+      ts = Math.max(ts, Number(f.created_at ? Date.parse(f.created_at) : (f.timestamp ? f.timestamp / 1000 : 0)) || 0);
+    }
+    if(!(qty > 0) || !(notional > 0)) continue;
+    const avg = notional / qty;
+    const cs = CONTRACT[asset] || 1;
+    const units = qty * cs;
+    const usdNotional = units * avg;
+    const date = ts ? new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date(ts)) : todayIST();
+
+    journal.push({
+      id: Date.now() + Math.floor(Math.random() * 1e6),
+      deltaKey: key,                              // idempotency anchor
+      date,
+      time: ts ? new Date(ts).toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }) : '',
+      symbol: asset,
+      dir: side === 'sell' ? 'short' : 'long',
+      entry: Number(avg.toFixed(2)),
+      exit: '',                                   // a fill is an execution, not a round trip
+      stop: '',
+      size: Number(usdNotional.toFixed(2)),
+      margin: '',                                 // unknown from a fill; leave for the user
+      lev: '',
+      orderType: 'taker',
+      entryFee: Number(fee.toFixed(4)) || 0,
+      exitFee: 0,
+      notes: 'Imported from Delta',
+      grade: 'A',
+      status: 'planned',                          // open until you add the closing price
+      ttype: null,
+      openedAt: ts || Date.now(),
+      closedAt: null,
+      session: null,
+      source: 'delta'
+    });
+    added++;
+  }
+
+  const res = jSave();
+  renderPnl();
+  if(!res.ok){ plSyncStatus('⚠ ' + res.reason, 'err'); return; }
+  plSyncStatus(
+    `✓ Imported <b>${added}</b> new trade${added === 1 ? '' : 's'}` +
+    (skipped ? `, skipped ${skipped} already synced` : '') +
+    `. They are open positions — add each exit price to see realised P&L.`, 'ok');
+}
+
 function plReset(){
   if(!confirm('Reset the P&L Dashboard?\n\nThis deletes EVERY trade and your capital settings from this browser. Export a backup first if you want to keep them.')) return;
   if(!confirm('Last check — this cannot be undone. Delete all ' + journal.length + ' trades?')) return;
@@ -4883,6 +5088,7 @@ function plSyncCfgInputs(){
   bind('pl-print', plPrint);
   bind('pl-reset', plReset);
   bind('pl-import', () => { const f = $('pl-file'); if(f) f.click(); });
+  bind('pl-sync', () => plOpenSync());
   bind('pl-privacy', () => {
     privacyOn = !privacyOn;
     try { localStorage.setItem('strade_priv', privacyOn ? '1' : '0'); } catch(e){}
@@ -4903,6 +5109,29 @@ function plSyncCfgInputs(){
       setTimeout(plRenderCharts, 40);
       plRefreshLive(false);            // opening the tab should never show a stale quote
     }));
+
+  // ---- Delta sync modal ----
+  const syncM = $('pl-sync-modal');
+  function plOpenSync(){
+    window.plOpenSync = plOpenSync;
+    const c = plSyncCfg();
+    if(c.url && $('pl-sync-url')){ $('pl-sync-url').value = c.url; $('pl-sync-save').checked = true; }
+    if(c.token && $('pl-sync-token')) $('pl-sync-token').value = c.token;
+    if($('pl-sync-to') && !$('pl-sync-to').value) $('pl-sync-to').value = todayIST();
+    if($('pl-sync-from') && !$('pl-sync-from').value){
+      const d = new Date(Date.now() - 30 * 86400e3);
+      $('pl-sync-from').value = new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Kolkata' }).format(d);
+    }
+    if(c.url) plSyncStatus('Saved Worker found. Choose a range and sync.');
+    if(syncM) syncM.style.display = 'flex';
+  };
+  const closeSync = () => { if(syncM) syncM.style.display = 'none'; };
+  const scl = $('pl-sync-close'); if(scl) scl.addEventListener('click', closeSync);
+  if(syncM) syncM.addEventListener('click', e => { if(e.target === syncM) closeSync(); });
+  const sgo = $('pl-sync-go'); if(sgo) sgo.addEventListener('click', () => plSyncFetch(false));
+  const stst = $('pl-sync-test'); if(stst) stst.addEventListener('click', () => plSyncFetch(true));
+  const ssave = $('pl-sync-save');
+  if(ssave) ssave.addEventListener('change', () => { if(!ssave.checked) plSyncCfgSave({}); });
 
   plStartFeed();
   plRefreshLive(false);
